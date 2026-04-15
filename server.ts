@@ -37,13 +37,73 @@ async function startServer() {
 
   // Cache (store in memory)
   const seoCache = new Map<string, { html: string; timestamp: number }>();
-  const billboardFunnels = new Map<string, { id: string; html: string; timestamp: number }>();
+  // billboardFunnels is now used only for temporary storage before payment confirmation
+  const tempFunnels = new Map<string, { id: string; html: string; prompt: string; timestamp: number }>();
 
-  app.get('/api/billboard', (req, res) => {
-    const funnels = Array.from(billboardFunnels.values())
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, 8);
-    res.json({ funnels });
+  app.get('/api/my-funnels', async (req, res) => {
+    const userId = req.query.userId as string;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    try {
+      const { data, error } = await supabase
+        .from('funnels')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      res.json({ funnels: data });
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to fetch funnels' });
+    }
+  });
+
+  app.get('/api/user-stats', async (req, res) => {
+    const userId = req.query.userId as string;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    try {
+      const { data, error } = await supabase
+        .from('users')
+        .select('plan, messages_used')
+        .eq('id', userId)
+        .single();
+
+      if (error) throw error;
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to fetch stats' });
+    }
+  });
+    try {
+      const { data, error } = await supabase
+        .from('funnels')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(8);
+
+      if (error) throw error;
+      res.json({ funnels: data });
+    } catch (err) {
+      console.error('Billboard fetch error:', err);
+      res.status(500).json({ error: 'Failed to fetch billboard' });
+    }
+  });
+
+  app.get('/f/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+      const { data, error } = await supabase
+        .from('funnels')
+        .select('html')
+        .eq('id', id)
+        .single();
+
+      if (error || !data) return res.status(404).send('Funnel not found');
+      res.send(data.html);
+    } catch (err) {
+      res.status(500).send('Error loading funnel');
+    }
   });
 
   app.get('/seo/:slug', async (req, res) => {
@@ -144,10 +204,30 @@ async function startServer() {
   });
 
   app.post("/api/generate", express.json(), async (req, res) => {
-    const { prompt } = req.body;
+    const { prompt, userId } = req.body;
     if (!prompt) return res.status(400).json({ error: "Prompt is required" });
 
     try {
+      // Check usage limits if userId is provided
+      if (userId) {
+        const { data: userData, error: userError } = await supabase
+          .from('users')
+          .select('plan, messages_used')
+          .eq('id', userId)
+          .single();
+
+        if (userError && userError.code !== 'PGRST116') {
+          console.error('User fetch error:', userError);
+        }
+
+        // If user doesn't exist in our custom table yet, create them
+        if (!userData) {
+          await supabase.from('users').insert({ id: userId, plan: 'free', messages_used: 0 });
+        } else if (userData.plan === 'free' && userData.messages_used >= 3) {
+          return res.status(403).json({ error: "Daily limit reached. Upgrade to Pro for unlimited generations." });
+        }
+      }
+
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
       const response = await ai.models.generateContent({
         model: 'gemini-2.0-flash-exp',
@@ -167,6 +247,11 @@ async function startServer() {
         html = html.match(/```html([\s\S]*?)```/)?.[1] || html;
       } else if (html.includes('```')) {
         html = html.replace(/```/g, '');
+      }
+
+      // Increment usage if userId is provided and user is free
+      if (userId) {
+        await supabase.rpc('increment_messages', { user_id: userId });
       }
 
       const frontendDomain = process.env.FRONTEND_DOMAIN || req.get('host');
@@ -242,7 +327,7 @@ async function startServer() {
 
       // Store HTML in memory temporarily for the webhook to pick up
       if (tempId) {
-        billboardFunnels.set(`temp_${tempId}`, { id: tempId, html, timestamp: Date.now() });
+        tempFunnels.set(tempId, { id: tempId, html, prompt: prompt || "AI Funnel", timestamp: Date.now() });
       }
 
       res.json({ url: session.url });
@@ -281,7 +366,7 @@ async function startServer() {
       const data = await response.json();
       
       if (data.invoice_url) {
-        billboardFunnels.set(`temp_${orderId}`, { id: orderId, html, timestamp: Date.now() });
+        tempFunnels.set(orderId, { id: orderId, html, prompt: prompt || "AI Funnel", timestamp: Date.now() });
         res.json({ url: data.invoice_url });
       } else {
         console.error("NOWPayments Error:", data);
@@ -299,25 +384,42 @@ async function startServer() {
     if (payment_status === "finished" || payment_status === "confirmed") {
       const orderId = order_id;
       if (orderId) {
-        const funnel = billboardFunnels.get(`temp_${orderId}`);
+        const funnel = tempFunnels.get(orderId);
         if (funnel) {
-          billboardFunnels.set(orderId, { ...funnel, timestamp: Date.now() });
-          billboardFunnels.delete(`temp_${orderId}`);
-          console.log(`Funnel ${orderId} deployed via Crypto!`);
-
           // Extract userId if present
+          let userId = null;
           if (orderId.includes(':')) {
-            const [userId] = orderId.split(':');
-            await supabase.from('payments').insert({
-              user_id: userId,
-              provider: 'nowpayments',
-              amount: price_amount || 10,
-              currency: price_currency || 'usd',
-              status: 'confirmed',
-              payment_id: payment_id
-            });
+            userId = orderId.split(':')[0];
+          }
 
-            await supabase.from('users').update({ plan: 'pro' }).eq('id', userId);
+          // Save to Supabase
+          const { data: newFunnel, error: funnelError } = await supabase
+            .from('funnels')
+            .insert({
+              user_id: userId,
+              html: funnel.html,
+              prompt: funnel.prompt,
+              is_public: true
+            })
+            .select()
+            .single();
+
+          if (!funnelError) {
+            tempFunnels.delete(orderId);
+            console.log(`Funnel ${newFunnel.id} deployed via Crypto!`);
+
+            if (userId) {
+              await supabase.from('payments').insert({
+                user_id: userId,
+                provider: 'nowpayments',
+                amount: price_amount || 10,
+                currency: price_currency || 'usd',
+                status: 'confirmed',
+                payment_id: payment_id
+              });
+
+              await supabase.from('users').update({ plan: 'pro' }).eq('id', userId);
+            }
           }
         }
       }
@@ -346,26 +448,38 @@ async function startServer() {
       const userId = session.metadata?.user_id;
       
       if (tempId) {
-        const funnel = billboardFunnels.get(`temp_${tempId}`);
+        const funnel = tempFunnels.get(tempId);
         if (funnel) {
-          // Move from temp to permanent billboard
-          billboardFunnels.set(tempId, { ...funnel, timestamp: Date.now() });
-          billboardFunnels.delete(`temp_${tempId}`);
-          console.log(`Funnel ${tempId} deployed to billboard!`);
+          // Save to Supabase
+          const { data: newFunnel, error: funnelError } = await supabase
+            .from('funnels')
+            .insert({
+              user_id: userId || null,
+              html: funnel.html,
+              prompt: funnel.prompt,
+              is_public: true
+            })
+            .select()
+            .single();
 
-          // Record in Supabase if userId exists
-          if (userId) {
-            await supabase.from('payments').insert({
-              user_id: userId,
-              provider: 'stripe',
-              amount: session.amount_total ? session.amount_total / 100 : 10,
-              currency: session.currency || 'usd',
-              status: 'confirmed',
-              payment_id: session.id
-            });
+          if (!funnelError) {
+            tempFunnels.delete(tempId);
+            console.log(`Funnel ${newFunnel.id} deployed to billboard!`);
 
-            // Upgrade user plan
-            await supabase.from('users').update({ plan: 'pro' }).eq('id', userId);
+            // Record in Supabase if userId exists
+            if (userId) {
+              await supabase.from('payments').insert({
+                user_id: userId,
+                provider: 'stripe',
+                amount: session.amount_total ? session.amount_total / 100 : 10,
+                currency: session.currency || 'usd',
+                status: 'confirmed',
+                payment_id: session.id
+              });
+
+              // Upgrade user plan
+              await supabase.from('users').update({ plan: 'pro' }).eq('id', userId);
+            }
           }
         }
       }

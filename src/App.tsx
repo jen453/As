@@ -13,6 +13,8 @@ export default function App() {
   const [generatedHtml, setGeneratedHtml] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [billboardFunnels, setBillboardFunnels] = useState<any[]>([]);
+  const [myFunnels, setMyFunnels] = useState<any[]>([]);
+  const [userStats, setUserStats] = useState<{ plan: string, messages_used: number } | null>(null);
   const [isCheckingOut, setIsCheckingOut] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [authEmail, setAuthEmail] = useState('');
@@ -26,11 +28,22 @@ export default function App() {
     // Check current session
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user ?? null);
+      if (session?.user) {
+        fetchUserStats(session.user.id);
+        fetchMyFunnels(session.user.id);
+      }
     });
 
     // Listen for auth changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null);
+      if (session?.user) {
+        fetchUserStats(session.user.id);
+        fetchMyFunnels(session.user.id);
+      } else {
+        setUserStats(null);
+        setMyFunnels([]);
+      }
     });
 
     const params = new URLSearchParams(window.location.search);
@@ -71,6 +84,26 @@ export default function App() {
       setBillboardFunnels(data.funnels);
     } catch (err) {
       console.error('Failed to fetch billboard', err);
+    }
+  };
+
+  const fetchUserStats = async (userId: string) => {
+    try {
+      const res = await fetch(`/api/user-stats?userId=${userId}`);
+      const data = await res.json();
+      setUserStats(data);
+    } catch (err) {
+      console.error('Failed to fetch stats', err);
+    }
+  };
+
+  const fetchMyFunnels = async (userId: string) => {
+    try {
+      const res = await fetch(`/api/my-funnels?userId=${userId}`);
+      const data = await res.json();
+      setMyFunnels(data.funnels);
+    } catch (err) {
+      console.error('Failed to fetch my funnels', err);
     }
   };
 
@@ -146,13 +179,17 @@ export default function App() {
       const response = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, userId: user?.id }),
       });
 
-      if (!response.ok) throw new Error('Failed to generate funnel');
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || 'Failed to generate funnel');
+      }
       
       const data = await response.json();
       setGeneratedHtml(data.html);
+      if (user) fetchUserStats(user.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong');
     } finally {
@@ -202,7 +239,9 @@ export default function App() {
                 </div>
                 <div className="flex-1 min-w-0">
                   <p className="text-xs font-bold text-white truncate">{user.email}</p>
-                  <p className="text-[10px] text-text-muted uppercase font-bold">Pro Member</p>
+                  <p className="text-[10px] text-text-muted uppercase font-bold">
+                    {userStats?.plan === 'pro' ? 'Pro Member' : `Free Plan (${userStats?.messages_used || 0}/3)`}
+                  </p>
                 </div>
               </div>
               <button 
@@ -494,15 +533,14 @@ export default function App() {
                         style={{ width: '400%', height: '400%' }}
                       />
                       <div className="absolute inset-0 bg-secondary/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center backdrop-blur-sm">
-                         <button 
-                          onClick={() => {
-                            const win = window.open('', '_blank');
-                            win?.document.write(funnel.html);
-                          }}
+                         <a 
+                          href={`/f/${funnel.id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
                           className="bg-white text-secondary px-6 py-2 rounded-full text-xs font-bold shadow-xl hover:scale-105 transition-transform"
                          >
                            View Live Funnel
-                         </button>
+                         </a>
                       </div>
                     </div>
                   ))
@@ -518,12 +556,83 @@ export default function App() {
           )}
 
           {activeTab === 'dashboard' && (
-             <div className="flex flex-col items-center justify-center py-20 text-center">
-                <div className="w-20 h-20 bg-primary/10 rounded-full flex items-center justify-center mb-6">
-                  <BarChart3 className="w-10 h-10 text-primary" />
+             <div className="space-y-8">
+                <div className="grid grid-cols-4 gap-6">
+                  {[
+                    { label: 'My Funnels', value: myFunnels.length.toString(), trend: 'Live deployments' },
+                    { label: 'AI Usage', value: `${userStats?.messages_used || 0}/3`, trend: userStats?.plan === 'pro' ? 'Unlimited' : 'Daily limit' },
+                    { label: 'Account Plan', value: userStats?.plan?.toUpperCase() || 'FREE', trend: 'Status' },
+                    { label: 'Total Revenue', value: '$0.00', trend: 'Lifetime' },
+                  ].map((stat, i) => (
+                    <div key={i} className="bg-white p-6 rounded-2xl border border-border-light shadow-sm">
+                      <span className="text-[10px] uppercase tracking-wider font-bold text-text-muted mb-2 block">{stat.label}</span>
+                      <div className="text-2xl font-bold text-text-main">{stat.value}</div>
+                      <div className="text-[10px] mt-2 text-success font-semibold">{stat.trend}</div>
+                    </div>
+                  ))}
                 </div>
-                <h2 className="text-2xl font-bold mb-2">Analytics Coming Soon</h2>
-                <p className="text-text-muted max-w-sm">We're currently building the deep analytics engine to track every click and conversion across your funnels.</p>
+
+                <div className="bg-white rounded-2xl border border-border-light shadow-sm overflow-hidden">
+                  <div className="px-6 py-4 border-b border-border-light bg-gray-50/50 flex justify-between items-center">
+                    <h2 className="text-sm font-bold">My Deployed Funnels</h2>
+                    <button 
+                      onClick={() => setActiveTab('builder')}
+                      className="text-[10px] text-primary font-bold uppercase hover:underline"
+                    >
+                      + Create New
+                    </button>
+                  </div>
+                  {myFunnels.length > 0 ? (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr className="bg-gray-50/50 text-[10px] uppercase tracking-wider text-text-muted font-bold">
+                            <th className="px-6 py-3 border-b border-border-light">Funnel ID</th>
+                            <th className="px-6 py-3 border-b border-border-light">Prompt Snippet</th>
+                            <th className="px-6 py-3 border-b border-border-light">Created</th>
+                            <th className="px-6 py-3 border-b border-border-light text-right">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="text-sm">
+                          {myFunnels.map((funnel) => (
+                            <tr key={funnel.id} className="hover:bg-gray-50 transition-colors">
+                              <td className="px-6 py-4 border-b border-border-light font-mono text-xs text-text-muted">
+                                {funnel.id.substring(0, 8)}...
+                              </td>
+                              <td className="px-6 py-4 border-b border-border-light font-bold text-text-main truncate max-w-[200px]">
+                                {funnel.prompt}
+                              </td>
+                              <td className="px-6 py-4 border-b border-border-light text-text-muted">
+                                {new Date(funnel.created_at).toLocaleDateString()}
+                              </td>
+                              <td className="px-6 py-4 border-b border-border-light text-right">
+                                <a 
+                                  href={`/f/${funnel.id}`} 
+                                  target="_blank" 
+                                  rel="noopener noreferrer"
+                                  className="text-primary hover:underline font-bold text-xs flex items-center justify-end gap-1"
+                                >
+                                  View <ExternalLink className="w-3 h-3" />
+                                </a>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="py-20 text-center">
+                      <Layout className="w-12 h-12 text-gray-200 mx-auto mb-4" />
+                      <p className="text-text-muted text-sm">You haven't deployed any funnels yet.</p>
+                      <button 
+                        onClick={() => setActiveTab('builder')}
+                        className="mt-4 text-primary font-bold text-sm hover:underline"
+                      >
+                        Start building now →
+                      </button>
+                    </div>
+                  )}
+                </div>
              </div>
           )}
 
